@@ -1,0 +1,34 @@
+
+=== bench: /Users/gunalanr/Desktop/projects/lowPoly/aspen.ppm 600x450, 10131 seeds, 18402 polygons (best of 3) ===
+canny     float, sqrt magnitude                       1.81 ms  
+canny     integer, squared magnitude                  1.52 ms  1.2x
+canny     gpu front half + cpu hysteresis             1.49 ms  1.0x vs integer cpu
+voronoi   brute force (original)                    264.30 ms  
+voronoi   jump flooding +2 (rust)                     5.15 ms  51.3x vs brute
+voronoi   grid ring search, exact                     1.49 ms  3.5x vs jfa
+voronoi   grid ring search, gpu                       0.92 ms  1.6x vs cpu grid
+extract   sort + unique (original)                    1.79 ms  
+extract   flat hash dedup                             0.56 ms  3.2x
+hull      monotone chain                              0.60 ms  
+hull      quickhull                                   0.60 ms  1.0x
+raster    full-image scan per shape (original)    11089.54 ms  extrapolated from 64 shapes
+raster    bbox edge functions + colour, banded        1.25 ms  8875x
+raster    owner lookup + colour                       1.15 ms  1.1x vs bbox
+raster    owner lookup + colour, gpu                  1.24 ms  1.0x vs bbox cpu
+
+=== bench: /Users/gunalanr/Desktop/projects/lowPoly/alto.ppm 2000x1125, 30386 seeds, 57415 polygons (best of 3) ===
+canny     float, sqrt magnitude                       4.71 ms  
+canny     integer, squared magnitude                  2.60 ms  1.8x
+canny     gpu front half + cpu hysteresis             2.08 ms  1.3x vs integer cpu
+voronoi   brute force (original)                      0.00 ms  skipped, too large
+voronoi   jump flooding +2 (rust)                    25.38 ms  
+voronoi   grid ring search, exact                    12.01 ms  2.1x vs jfa
+voronoi   grid ring search, gpu                       3.05 ms  3.9x vs cpu grid
+extract   sort + unique (original)                    6.27 ms  
+extract   flat hash dedup                             1.78 ms  3.5x
+hull      monotone chain                              2.27 ms  
+hull      quickhull                                   2.21 ms  1.0x
+raster    full-image scan per shape (original)   251223.03 ms  extrapolated from 64 shapes
+raster    bbox edge functions + colour, banded        5.79 ms  43393x
+raster    owner lookup + colour                       5.91 ms  1.0x vs bbox
+raster    owner lookup + colour, gpu                  4.10 ms  1.4x vs bbox cpu

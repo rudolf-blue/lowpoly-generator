@@ -1,0 +1,8 @@
+out/
+*.o
+/lowpoly
+/lowpoly-test
+.DS_Store
+.superpowers/
+*-lowpoly.png
+!docs/img/*-lowpoly.png
