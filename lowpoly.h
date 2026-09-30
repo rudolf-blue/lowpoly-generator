@@ -38,13 +38,14 @@ enum class VoronoiMode { Grid, Jfa, Brute };
 enum class Backend { Auto, Cpu, Gpu };
 
 struct Params {
-    std::string in, out, text, stages = "out";
-    int points = 10000, levels = 150, border = 16, threads = 0;
-    double uniform = 0.08;
+    std::string in, text, stages;
+    std::vector<std::string> outs;
+    int points = 10000, levels = 150, threads = 0, aa = 1, relax = 2;
+    double uniform = 0.08, refine = 0.95, scale = 1, merge = 1;
     uint64_t seed = 24301;
     float canny_low = 5.f, canny_high = 25.f;
-    bool auto_canny = false, no_stages = false, hull = false, bench = false, quiet = false;
-    bool canny_float = false, extract_sort = false, raster_owner = false;
+    bool auto_canny = false, hull = false, bench = false, quiet = false;
+    bool canny_float = false, extract_sort = false, raster_owner = false, flip = true;
     ColorMode color = ColorMode::Mean;
     VoronoiMode voronoi = VoronoiMode::Grid;
     Backend backend = Backend::Auto;
@@ -56,15 +57,24 @@ void parallel_for(int n, const std::function<void(int, int)>& fn);
 
 bool load_image(const std::string& path, Image& img, std::string& err);
 bool save_image(const std::string& path, const Image& img, std::string& err);
+bool write_png(const std::string& path, const Image& img);
 bool platform_decode(const std::string& path, Image& img);
+bool stb_decode(const std::string& path, Image& img, std::string& err);   // stb + exif orientation
+int jpeg_orientation(const uint8_t* d, size_t n);                        // 1..8, 1 if absent
+void apply_orientation(Image& img, int exif);
 bool platform_encode(const std::string& path, const Image& img);
+bool platform_can_encode(const std::string& ext);
 
 std::vector<uint8_t> to_luma(const Image& img);
 // cls: 0 none, 1 weak, 2 strong; low2/high2 are squared thresholds
 void canny_classify(const std::vector<uint8_t>& luma, int w, int h, int low2, int high2, bool auto_thr,
                     std::vector<uint8_t>& cls);
 void hysteresis(std::vector<uint8_t>& cls, int w, int h);   // in place, cls becomes a 0/255 mask
+void add_side_seeds(std::vector<Pt>& seeds, int w, int h);
 std::vector<Pt> sample_points(const std::vector<uint8_t>& mask, int w, int h, const Params& p);
+// add seeds where the flat fill is worst, up to `target`
+struct Gpu;
+void refine_seeds(const Image& src, std::vector<Pt>& seeds, size_t target, Gpu* gpu = nullptr);
 
 struct SeedGrid {
     int g = 0, gw = 0, gh = 0;
@@ -81,11 +91,24 @@ int64_t signed_area2(const Pt* v, int n);
 std::vector<Pt> hull_monotone(std::vector<Pt> pts);
 std::vector<Pt> hull_quick(const std::vector<Pt>& pts);
 
-std::vector<Polygon> extract_polygons(const std::vector<uint32_t>& owner, int w, int h, const std::vector<Pt>& seeds);
+// exact repairs overlaps so the mesh tiles the image
+std::vector<Polygon> extract_polygons(const std::vector<uint32_t>& owner, int w, int h, const std::vector<Pt>& seeds,
+                                      bool exact = true);
 void build_csr(const std::vector<Polygon>& polys, size_t nseeds, std::vector<uint32_t>& off, std::vector<uint32_t>& idx);
 
+// join triangle pairs into quads when the cost is below rel x the mean error, colours all
+// flip shared edges while the colour error drops, returns flips
+int flip_edges(const Image& src, const std::vector<Pt>& seeds, std::vector<Polygon>& polys);
+// move vertices while the colour error drops, returns moves
+int relax_vertices(const Image& src, std::vector<Pt>& seeds, std::vector<Polygon>& polys, int rounds);
+Polygon make_tri(const std::vector<Pt>& seeds, uint32_t a, uint32_t b, uint32_t c);
+void merge_flat_pairs(const Image& src, std::vector<Polygon>& polys, double rel);
 void color_polygons(const Image& src, std::vector<Polygon>& polys, ColorMode mode);
 void rasterize(Image& dst, const std::vector<Polygon>& polys);
+// w x h mesh drawn at W x H, aa x aa supersampled
+Image render_scaled(const std::vector<Polygon>& polys, int w, int h, int W, int H, int aa, Rgb bg);
+std::string svg_string(const std::vector<Polygon>& polys, int w, int h, int W, int H);
+bool write_svg(const std::string& path, const std::vector<Polygon>& polys, int w, int h, int W, int H);
 void rasterize_by_owner(const Image& src, const std::vector<uint32_t>& owner, const std::vector<uint32_t>& csr_off,
                         const std::vector<uint32_t>& csr_idx, std::vector<Polygon>& polys, Rgb background, Image& dst);
 

@@ -2,12 +2,13 @@
 # ablation: run the pipeline with each optimisation switched off in turn.
 # usage: scripts/ablate.sh <lowpoly binary> <image> <points> [label]
 # prints one markdown row per configuration: median pipeline ms of 5 runs.
+# rows use the plain pipeline except the last.
 B=$1; IMG=$2; PTS=$3; LABEL=${4:-}
 run() {
     name=$1; shift
     ms=""
     for i in 1 2 3 4 5; do
-        t=$("$B" "$IMG" --no-stages -o /dev/null --points "$PTS" "$@" 2>/dev/null | awk '/^  total/ {print $2}')
+        t=$("$B" "$IMG" --no-stages -o /dev/null --points "$PTS" --refine 0 --flip off --relax 0 --merge 0 "$@" 2>/dev/null | awk '/^  total/ {print $2}')
         ms="$ms $t"
     done
     med=$(echo $ms | tr ' ' '\n' | sort -n | sed -n 3p)
@@ -27,3 +28,4 @@ run "everything off, single thread"     --backend cpu --threads 1 --canny float 
 run "gpu"                               --backend gpu
 run "gpu, single host thread"           --backend gpu --threads 1
 run "gpu with hull overlay"             --backend gpu --hull
+run "default"                           --backend cpu --refine 0.95 --flip on --relax 2 --merge 1
