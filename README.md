@@ -15,13 +15,13 @@ Windows. There is an optional Metal backend on macOS and CUDA backend on
 Linux and Windows.
 
 ```
-lowpoly.h     types and stage signatures
-lowpoly.cpp   pipeline, cli, png writer, tests
-metal.mm      Metal kernels, ImageIO decode and encode
+lowpoly.h     types, stage signatures, the Gpu interface
+lowpoly.cpp   cpu pipeline, cli, png writer, stage dumps, bench, tests
+metal.mm      Metal kernels (compiled at startup) and ImageIO decode/encode
 cuda.cu       the same kernels for CUDA
 ```
 
-## Build and run
+## 1. What it does
 
 ```sh
 make                # macOS, cpu and Metal
@@ -42,7 +42,7 @@ Input is anything stb_image reads, and on macOS anything ImageIO reads (heic,
 webp, tiff, avif). Phone photos are turned upright. Output is png, jpg, bmp,
 tga, ppm or svg, plus heic and tiff on macOS. Paths can be any Unicode.
 
-## How it works
+## 2. How it works
 
 Shown on `examples/monarch.jpg` at 2500 points.
 
@@ -83,7 +83,7 @@ pixel belongs to exactly one polygon.
 
 ![](docs/img/monarch/final.png)
 
-## Options
+## 3. Options
 
 ```
 lowpoly <input> [options]
@@ -119,7 +119,7 @@ lowpoly <input> [options]
 `--relax 0` is about twice as fast for about 2 dB less detail.
 `--refine 0 --flip off --relax 0 --merge 0` is the plain pipeline.
 
-## Results
+## 4. Results
 
 PSNR against the photo (higher keeps more detail), polygon count, and
 pipeline time on an M5 Pro. The README images use `--points 2500 --uniform
@@ -142,7 +142,7 @@ points, with about a fifth of the polygons.
 The GPU backends are checked against the CPU bit for bit in `make test`, but
 `--backend auto` stays on the CPU, which is faster end to end.
 
-## Examples
+### Examples
 
 Source on the left, output on the right. All stage images are in
 `docs/img/<name>/`. Regenerate them with `make readme-images`.
