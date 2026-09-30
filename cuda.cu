@@ -4,7 +4,15 @@
 #include <cstring>
 
 struct Params32 { uint32_t w, h; int32_t low2, high2; uint32_t g, gw, gh, npoly; };
-struct PolyGpu { int2 v[4]; uint32_t n, pad[3]; };
+struct PolyGpu { int2 v[4]; uint32_t s[4]; uint32_t n, pad[3]; };
+
+__device__ bool poly_has(const PolyGpu& q, int x, int y) {
+    for (uint32_t i = 0; i < q.n; i++) {
+        int2 u = q.v[i], v = q.v[(i + 1) % q.n];
+        if ((v.x - u.x) * (y - u.y) - (v.y - u.y) * (x - u.x) < 0) return false;
+    }
+    return true;
+}
 
 #define PIX \
     int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y; \
@@ -63,11 +71,11 @@ __global__ void k_nms_threshold(const int* mag, const uint8_t* dir, uint8_t* cls
     cls[i] = v >= P.high2 ? 2 : v >= P.low2 ? 1 : 0;
 }
 
-__global__ void k_voronoi(const int2* seeds, const uint32_t* off, const uint32_t* idx, uint32_t* owner, Params32 P) {
-    PIX
-    int g = P.g, gw = P.gw, gh = P.gh, cx = x / g, cy = y / g;
+// exact nearest seed, ties to the lowest index
+__device__ uint32_t ring_nearest(int x, int y, const int2* seeds, const uint32_t* off, const uint32_t* idx, const Params32& P) {
+    int g = P.g, gw = P.gw, gh = P.gh, cx = x / g, cy = y / g, rmax = max(gw, gh);
     uint32_t best = 0xFFFFFFFFu;
-    int bd = 0x7FFFFFFF, rmax = max(gw, gh);
+    int bd = 0x7FFFFFFF;
     for (int r = 0; r <= rmax; r++) {
         if (r > 0) {
             int lim = (r - 1) * g + 1;
@@ -90,6 +98,55 @@ __global__ void k_voronoi(const int2* seeds, const uint32_t* off, const uint32_t
             }
         }
     }
+    return best;
+}
+
+// one 8x8 block per tile, candidates within d0 + 2r in shared memory, ring search if too many
+#define VOR_T 8
+#define VOR_MAXC 128
+__global__ void k_voronoi(const int2* seeds, const uint32_t* off, const uint32_t* idx, uint32_t* owner, Params32 P) {
+    __shared__ uint32_t cand[VOR_MAXC];
+    __shared__ unsigned int count;
+    __shared__ int tile[4];   // centre bin x, y, radius, lim2
+    int x0 = blockIdx.x * VOR_T, y0 = blockIdx.y * VOR_T;
+    int x1 = min(x0 + VOR_T, (int)P.w), y1 = min(y0 + VOR_T, (int)P.h);
+    int cx = (x0 + x1 - 1) / 2, cy = (y0 + y1 - 1) / 2;
+    int lid = threadIdx.y * VOR_T + threadIdx.x;
+    if (lid == 0) {
+        count = 0;
+        int2 n = seeds[ring_nearest(cx, cy, seeds, off, idx, P)];
+        int rx = max(cx - x0, x1 - 1 - cx), ry = max(cy - y0, y1 - 1 - cy);
+        float lim = sqrtf(float((cx - n.x) * (cx - n.x) + (cy - n.y) * (cy - n.y))) + 2 * sqrtf(float(rx * rx + ry * ry)) + 2;
+        int li = int(lim) + 1;
+        tile[0] = cx / (int)P.g; tile[1] = cy / (int)P.g; tile[2] = li / (int)P.g + 1; tile[3] = li * li;
+    }
+    __syncthreads();
+    int bcx = tile[0], bcy = tile[1], br = tile[2], lim2 = tile[3], side = 2 * br + 1;
+    for (int b = lid; b < side * side; b += VOR_T * VOR_T) {
+        int bx = bcx - br + b % side, by = bcy - br + b / side;
+        if (bx < 0 || by < 0 || bx >= (int)P.gw || by >= (int)P.gh) continue;
+        uint32_t bb = by * P.gw + bx;
+        for (uint32_t k = off[bb]; k < off[bb + 1]; k++) {
+            int2 s = seeds[idx[k]];
+            if ((cx - s.x) * (cx - s.x) + (cy - s.y) * (cy - s.y) > lim2) continue;
+            unsigned int slot = atomicAdd(&count, 1u);
+            if (slot < VOR_MAXC) cand[slot] = idx[k];
+        }
+    }
+    __syncthreads();
+    int x = x0 + threadIdx.x, y = y0 + threadIdx.y;
+    if (x >= (int)P.w || y >= (int)P.h) return;
+    uint32_t nc = count, best = 0xFFFFFFFFu;
+    if (nc > VOR_MAXC) best = ring_nearest(x, y, seeds, off, idx, P);
+    else {
+        int bd = 0x7FFFFFFF;
+        for (uint32_t j = 0; j < nc; j++) {
+            uint32_t i = cand[j];
+            int2 s = seeds[i];
+            int dx = x - s.x, dy = y - s.y, d = dx * dx + dy * dy;
+            if (d < bd || (d == bd && i < best)) { bd = d; best = i; }
+        }
+    }
     owner[y * P.w + x] = best;
 }
 
@@ -97,15 +154,14 @@ __global__ void k_raster_find(const uint8_t* rgb, const uint32_t* owner, const u
                               const PolyGpu* polys, uint32_t* pid, unsigned int* sums, Params32 P) {
     PIX
     uint32_t k = y * P.w + x, s = owner[k], found = 0xFFFFFFFFu;
+    // own polygons, then neighbours', then any own one
+    for (uint32_t j = off[s]; j < off[s + 1] && found == 0xFFFFFFFFu; j++) if (poly_has(polys[idx[j]], x, y)) found = idx[j];
     for (uint32_t j = off[s]; j < off[s + 1] && found == 0xFFFFFFFFu; j++) {
-        PolyGpu q = polys[idx[j]];
-        bool in = true;
-        for (uint32_t i = 0; i < q.n; i++) {
-            int2 u = q.v[i], v = q.v[(i + 1) % q.n];
-            if ((v.x - u.x) * (y - u.y) - (v.y - u.y) * (x - u.x) < 0) { in = false; break; }
-        }
-        if (in) found = idx[j];
+        const PolyGpu& q = polys[idx[j]];
+        for (uint32_t v = 0; v < q.n && found == 0xFFFFFFFFu; v++)
+            for (uint32_t m = off[q.s[v]]; m < off[q.s[v] + 1] && found == 0xFFFFFFFFu; m++) if (poly_has(polys[idx[m]], x, y)) found = idx[m];
     }
+    if (found == 0xFFFFFFFFu && off[s] < off[s + 1]) found = idx[off[s]];
     pid[k] = found;
     if (found == 0xFFFFFFFFu) return;
     atomicAdd(&sums[found * 4 + 0], (unsigned)rgb[k * 3]);
@@ -190,7 +246,7 @@ struct CudaGpu : Gpu {
         seeds = dev_copy((const int2*)s.data(), s.size());
         d_off = dev_copy(gr.off.data(), gr.off.size());
         d_idx = dev_copy(gr.idx.data(), gr.idx.size());
-        k_voronoi<<<grid(), block>>>(seeds, d_off, d_idx, owner, P);
+        k_voronoi<<<dim3((w + VOR_T - 1) / VOR_T, (h + VOR_T - 1) / VOR_T), dim3(VOR_T, VOR_T)>>>(seeds, d_off, d_idx, owner, P);
         o.resize((size_t)w * h);
         cudaMemcpy(o.data(), owner, o.size() * 4, cudaMemcpyDeviceToHost);
     }
@@ -201,7 +257,7 @@ struct CudaGpu : Gpu {
         std::vector<PolyGpu> pg(np);
         for (size_t i = 0; i < np; i++) {
             pg[i].n = ps[i].n;
-            for (int j = 0; j < 4; j++) pg[i].v[j] = make_int2(ps[i].v[j].x, ps[i].v[j].y);
+            for (int j = 0; j < 4; j++) { pg[i].v[j] = make_int2(ps[i].v[j].x, ps[i].v[j].y); pg[i].s[j] = ps[i].s[j]; }
         }
         if (polys) cudaFree(polys);
         if (sums) cudaFree(sums);

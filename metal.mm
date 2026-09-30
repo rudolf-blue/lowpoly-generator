@@ -71,14 +71,11 @@ kernel void nms_threshold(device const int* mag [[buffer(0)]], device const ucha
     cls[i] = v >= P.high2 ? 2 : v >= P.low2 ? 1 : 0;
 }
 
-kernel void voronoi(device const int2* seeds [[buffer(0)]], device const uint* off [[buffer(1)]], device const uint* idx [[buffer(2)]],
-                    device uint* owner [[buffer(3)]], constant Params& P [[buffer(4)]], uint2 id [[thread_position_in_grid]]) {
-    if (id.x >= P.w || id.y >= P.h) return;
-    int x = id.x, y = id.y, g = P.g, gw = P.gw, gh = P.gh;
-    int cx = x / g, cy = y / g;
+// exact nearest seed, ties to the lowest index
+uint ring_nearest(int x, int y, device const int2* seeds, device const uint* off, device const uint* idx, constant Params& P) {
+    int g = P.g, gw = P.gw, gh = P.gh, cx = x / g, cy = y / g, rmax = max(gw, gh);
     uint best = 0xFFFFFFFFu;
     int bd = 0x7FFFFFFF;
-    int rmax = max(gw, gh);
     for (int r = 0; r <= rmax; r++) {
         if (r > 0) {
             int lim = (r - 1) * g + 1;
@@ -86,8 +83,7 @@ kernel void voronoi(device const int2* seeds [[buffer(0)]], device const uint* o
         }
         for (int by = cy - r; by <= cy + r; by++) {
             if (by < 0 || by >= gh) continue;
-            bool edge_row = by == cy - r || by == cy + r;
-            int step = edge_row ? 1 : 2 * r;
+            int step = (by == cy - r || by == cy + r) ? 1 : 2 * r;
             for (int bx = cx - r; bx <= cx + r; bx += step) {
                 if (bx >= 0 && bx < gw) {
                     uint b = by * gw + bx;
@@ -102,10 +98,68 @@ kernel void voronoi(device const int2* seeds [[buffer(0)]], device const uint* o
             }
         }
     }
+    return best;
+}
+
+// one 8x8 threadgroup per tile, candidates within d0 + 2r, ring search if too many
+constant constexpr uint VOR_T = 8, VOR_MAXC = 128;
+kernel void voronoi(device const int2* seeds [[buffer(0)]], device const uint* off [[buffer(1)]], device const uint* idx [[buffer(2)]],
+                    device uint* owner [[buffer(3)]], constant Params& P [[buffer(4)]], uint2 id [[thread_position_in_grid]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
+                    uint2 tsz [[threads_per_threadgroup]]) {
+    threadgroup uint cand[VOR_MAXC];
+    threadgroup atomic_uint count;
+    threadgroup int tile[4];   // centre bin x, y, radius, lim2
+    int x0 = tg.x * VOR_T, y0 = tg.y * VOR_T, x1 = min(x0 + (int)VOR_T, (int)P.w), y1 = min(y0 + (int)VOR_T, (int)P.h);
+    int cx = (x0 + x1 - 1) / 2, cy = (y0 + y1 - 1) / 2;
+    if (lid == 0) {
+        atomic_store_explicit(&count, 0u, memory_order_relaxed);
+        int2 n = seeds[ring_nearest(cx, cy, seeds, off, idx, P)];
+        int rx = max(cx - x0, x1 - 1 - cx), ry = max(cy - y0, y1 - 1 - cy);
+        float lim = sqrt(float((cx - n.x) * (cx - n.x) + (cy - n.y) * (cy - n.y))) + 2 * sqrt(float(rx * rx + ry * ry)) + 2;
+        int li = int(lim) + 1;
+        tile[0] = cx / (int)P.g; tile[1] = cy / (int)P.g; tile[2] = li / (int)P.g + 1; tile[3] = li * li;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int bcx = tile[0], bcy = tile[1], br = tile[2], lim2 = tile[3], side = 2 * br + 1;
+    // edge threadgroups can be smaller than 8x8
+    for (int b = lid; b < side * side; b += tsz.x * tsz.y) {
+        int bx = bcx - br + b % side, by = bcy - br + b / side;
+        if (bx < 0 || by < 0 || bx >= (int)P.gw || by >= (int)P.gh) continue;
+        uint bb = by * P.gw + bx;
+        for (uint k = off[bb]; k < off[bb + 1]; k++) {
+            int2 s = seeds[idx[k]];
+            if ((cx - s.x) * (cx - s.x) + (cy - s.y) * (cy - s.y) > lim2) continue;
+            uint slot = atomic_fetch_add_explicit(&count, 1u, memory_order_relaxed);
+            if (slot < VOR_MAXC) cand[slot] = idx[k];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (id.x >= P.w || id.y >= P.h) return;
+    int x = id.x, y = id.y;
+    uint nc = atomic_load_explicit(&count, memory_order_relaxed), best = 0xFFFFFFFFu;
+    if (nc > VOR_MAXC) best = ring_nearest(x, y, seeds, off, idx, P);
+    else {
+        int bd = 0x7FFFFFFF;
+        for (uint j = 0; j < nc; j++) {
+            uint i = cand[j];
+            int2 s = seeds[i];
+            int dx = x - s.x, dy = y - s.y, d = dx * dx + dy * dy;
+            if (d < bd || (d == bd && i < best)) { bd = d; best = i; }
+        }
+    }
     owner[y * P.w + x] = best;
 }
 
-struct Poly { int2 v[4]; uint n; uint pad[3]; };
+struct Poly { int2 v[4]; uint s[4]; uint n; uint pad[3]; };
+
+bool poly_has(Poly q, int x, int y) {
+    for (uint i = 0; i < q.n; i++) {
+        int2 u = q.v[i], v = q.v[(i + 1) % q.n];
+        if ((v.x - u.x) * (y - u.y) - (v.y - u.y) * (x - u.x) < 0) return false;
+    }
+    return true;
+}
 
 kernel void raster_find(device const uchar* rgb [[buffer(0)]], device const uint* owner [[buffer(1)]], device const uint* off [[buffer(2)]],
                         device const uint* idx [[buffer(3)]], device const Poly* polys [[buffer(4)]], device uint* pid [[buffer(5)]],
@@ -113,15 +167,14 @@ kernel void raster_find(device const uchar* rgb [[buffer(0)]], device const uint
     if (id.x >= P.w || id.y >= P.h) return;
     int x = id.x, y = id.y;
     uint k = y * P.w + x, s = owner[k], found = 0xFFFFFFFFu;
+    // own polygons, then neighbours', then any own one
+    for (uint j = off[s]; j < off[s + 1] && found == 0xFFFFFFFFu; j++) if (poly_has(polys[idx[j]], x, y)) found = idx[j];
     for (uint j = off[s]; j < off[s + 1] && found == 0xFFFFFFFFu; j++) {
         Poly q = polys[idx[j]];
-        bool in = true;
-        for (uint i = 0; i < q.n; i++) {
-            int2 u = q.v[i], v = q.v[(i + 1) % q.n];
-            if ((v.x - u.x) * (y - u.y) - (v.y - u.y) * (x - u.x) < 0) { in = false; break; }
-        }
-        if (in) found = idx[j];
+        for (uint v = 0; v < q.n && found == 0xFFFFFFFFu; v++)
+            for (uint m = off[q.s[v]]; m < off[q.s[v] + 1] && found == 0xFFFFFFFFu; m++) if (poly_has(polys[idx[m]], x, y)) found = idx[m];
     }
+    if (found == 0xFFFFFFFFu && off[s] < off[s + 1]) found = idx[off[s]];
     pid[k] = found;
     if (found == 0xFFFFFFFFu) return;
     atomic_fetch_add_explicit(&sums[found * 4 + 0], (uint)rgb[k * 3], memory_order_relaxed);
@@ -152,7 +205,7 @@ kernel void raster_paint(device const uint* pid [[buffer(0)]], device const ucha
 )MSL";
 
 struct Params32 { uint32_t w, h; int32_t low2, high2; uint32_t g, gw, gh, npoly; };
-struct PolyGpu { int32_t v[8]; uint32_t n, pad[3]; };
+struct PolyGpu { int32_t v[8]; uint32_t s[4]; uint32_t n, pad[3]; };
 
 namespace {
 struct MetalGpu : Gpu {
@@ -191,12 +244,13 @@ struct MetalGpu : Gpu {
         return b;
     }
 
-    void dispatch(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, std::initializer_list<id<MTLBuffer>> bufs, const Params32& P) {
+    void dispatch(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, std::initializer_list<id<MTLBuffer>> bufs, const Params32& P,
+                  int tg = 16) {
         [enc setComputePipelineState:p];
         int i = 0;
         for (auto b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
         [enc setBytes:&P length:sizeof P atIndex:i];
-        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(tg, tg, 1)];
     }
 
     void upload(const Image& img) override {
@@ -229,7 +283,7 @@ struct MetalGpu : Gpu {
         idx = buf(gr.idx.data(), gr.idx.size() * 4);
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        dispatch(enc, vor, {seeds, off, idx, owner}, P);
+        dispatch(enc, vor, {seeds, off, idx, owner}, P, 8);
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -243,7 +297,7 @@ struct MetalGpu : Gpu {
         std::vector<PolyGpu> pg(np);
         for (size_t i = 0; i < np; i++) {
             pg[i].n = ps[i].n;
-            for (int j = 0; j < 4; j++) { pg[i].v[2 * j] = ps[i].v[j].x; pg[i].v[2 * j + 1] = ps[i].v[j].y; }
+            for (int j = 0; j < 4; j++) { pg[i].v[2 * j] = ps[i].v[j].x; pg[i].v[2 * j + 1] = ps[i].v[j].y; pg[i].s[j] = ps[i].s[j]; }
         }
         polys = buf(pg.data(), np * sizeof(PolyGpu));
         id<MTLBuffer> coff = buf(csr_off.data(), csr_off.size() * 4);
@@ -289,11 +343,16 @@ bool platform_decode(const std::string& path, Image& img) {
         CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
         if (!src) return false;
         CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+        int ori = 1;   // ImageIO leaves exif orientation to us
+        if (CFDictionaryRef pr = CGImageSourceCopyPropertiesAtIndex(src, 0, nullptr)) {
+            if (auto v = (CFNumberRef)CFDictionaryGetValue(pr, kCGImagePropertyOrientation)) CFNumberGetValue(v, kCFNumberIntType, &ori);
+            CFRelease(pr);
+        }
         CFRelease(src);
         if (!cg) return false;
         int w = (int)CGImageGetWidth(cg), h = (int)CGImageGetHeight(cg);
         std::vector<uint8_t> rgba((size_t)w * h * 4);
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         CGContextRef ctx = CGBitmapContextCreate(rgba.data(), w, h, 8, (size_t)w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
         CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
         CGContextRelease(ctx);
@@ -301,24 +360,38 @@ bool platform_decode(const std::string& path, Image& img) {
         CGImageRelease(cg);
         img = Image(w, h);
         for (size_t i = 0; i < img.size(); i++) img.px[i] = {rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]};
+        apply_orientation(img, ori);
         return true;
     }
 }
 
+static CFStringRef uti_of(std::string e) {
+    for (auto& c : e) c = (char)tolower(c);
+    if (e == "png") return CFSTR("public.png");
+    if (e == "jpg" || e == "jpeg") return CFSTR("public.jpeg");
+    if (e == "heic") return CFSTR("public.heic");
+    if (e == "tif" || e == "tiff") return CFSTR("public.tiff");
+    if (e == "webp") return CFSTR("org.webmproject.webp");
+    return nullptr;
+}
+
+// formats ImageIO can write here
+bool platform_can_encode(const std::string& ext) {
+    CFStringRef uti = uti_of(ext);
+    if (!uti) return false;
+    CFArrayRef types = CGImageDestinationCopyTypeIdentifiers();
+    bool ok = CFArrayContainsValue(types, CFRangeMake(0, CFArrayGetCount(types)), uti);
+    CFRelease(types);
+    return ok;
+}
+
 bool platform_encode(const std::string& path, const Image& img) {
     size_t d = path.rfind('.');
-    std::string e = d == std::string::npos ? "" : path.substr(d + 1);
-    for (auto& c : e) c = (char)tolower(c);
-    CFStringRef uti;
-    if (e == "png") uti = CFSTR("public.png");
-    else if (e == "jpg" || e == "jpeg") uti = CFSTR("public.jpeg");
-    else if (e == "heic") uti = CFSTR("public.heic");
-    else if (e == "tif" || e == "tiff") uti = CFSTR("public.tiff");
-    else if (e == "webp") uti = CFSTR("org.webmproject.webp");
-    else return false;
+    CFStringRef uti = uti_of(d == std::string::npos ? "" : path.substr(d + 1));
+    if (!uti || !platform_can_encode(path.substr(d + 1))) return false;
     @autoreleasepool {
         CGDataProviderRef prov = CGDataProviderCreateWithData(nullptr, img.px.data(), img.size() * 3, nullptr);
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         CGImageRef cg = CGImageCreate(img.w, img.h, 8, 24, (size_t)img.w * 3, cs, kCGImageAlphaNone, prov, nullptr, false, kCGRenderingIntentDefault);
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
         CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, uti, 1, nullptr);
